@@ -1,7 +1,5 @@
 """Курсы GameCentr: перевод цены PS Store (UAH) в UZS и прайс PS Plus."""
 
-from __future__ import annotations
-
 # (минимальная цена в гривнах, курс UZS за 1 гривну), по возрастанию
 UAH_TIERS = [
     (249, 430),

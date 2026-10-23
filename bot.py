@@ -1,21 +1,17 @@
 """Telegram-бот GameCentr: присылаете название игры (или список, или фото) — получаете цену в UZS и обложку."""
 
-from __future__ import annotations
-
 import asyncio
 import html
 import io
 import logging
 import os
-import re
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatType, ParseMode
+from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
-from aiogram.utils.token import TokenValidationError
 
 from nlp import CHEAPEST, Request, ai_enabled, parse_message, parse_photo, search_variants
 from pricing import PS_PLUS_TEXT, fmt_uzs, uah_to_uzs
@@ -50,45 +46,25 @@ async def start(message: Message):
     )
 
 
-PSPLUS_RE = re.compile(
-    r"^\s*(/psplus\b|(сколько\s+сто\w+|прайс|цен\w*|какие)?\s*(на\s+)?"
-    r"(ps\s*plus|пс\s*плюс|подпис\w*|ea\s*play)\s*\??\s*$)",
-    re.I,
-)
-
-
 @dp.message(Command("psplus"))
 async def psplus(message: Message):
     await message.answer(PS_PLUS_TEXT)
 
 
-class StoreUnavailable(Exception):
-    """PS Store не ответил ни на один вариант запроса."""
-
-
 async def lookup(req: Request) -> list[Product]:
     """Пробуем варианты запроса: исходный, русский алиас, транслит."""
-    variants = search_variants(req.query)
-    errors = 0
-    for query in variants:
-        try:
-            if req.mode == CHEAPEST:
-                products = await find_cheapest(query, req.count, req.exclude_plus)
-            else:
-                product, _ = await find_game(query, req.edition or None)
-                products = [product] if product else []
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log.warning("Ошибка запроса к PS Store (%r): %r", query, e)
-            errors += 1
-            continue
+    for query in search_variants(req.query):
+        if req.mode == CHEAPEST:
+            products = await find_cheapest(query, req.count, req.exclude_plus)
+        else:
+            product, _ = await find_game(query, req.edition or None)
+            products = [product] if product else []
         if products:
             for p in products:
                 log.info("%r [%s %s] -> %r: %s, %s грн (база %s)", req.original or req.query, req.mode,
                          req.edition, query, p.name, p.final_uah, p.base_uah)
             return products
-    log.info("%r [%s] -> не найдено (варианты: %s)", req.original or req.query, req.mode, variants)
-    if errors == len(variants):
-        raise StoreUnavailable
+    log.info("%r [%s] -> не найдено", req.original or req.query, req.mode)
     return []
 
 
@@ -143,15 +119,14 @@ async def answer_requests(message: Message, requests: list[Request], wait: Messa
     found: list[tuple[Request, Product]] = []
     missing: list[Request] = []
     collections: list[Request] = []
-    unavailable: list[Request] = []
     for i, req in enumerate(requests, 1):
         if len(requests) > 1:
             await wait.edit_text(f"🔎 Ищу {i} из {len(requests)}: «{html.escape(req.query)}»...")
         try:
             products = await lookup(req)
-        except StoreUnavailable:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("Ошибка запроса к PS Store: %r", e)
             products = []
-            unavailable.append(req)
         if not products:
             missing.append(req)
         elif req.count > 1:
@@ -163,11 +138,6 @@ async def answer_requests(message: Message, requests: list[Request], wait: Messa
             await send_product(message, products[0], req)
 
     await wait.delete()
-    if unavailable:
-        await message.answer("⚠️ PS Store сейчас не отвечает, попробуйте через минуту.")
-        missing = [r for r in missing if r not in unavailable]
-        if not missing and not found and not collections:
-            return
     if len(requests) > 1 and found:
         total = sum(uah_to_uzs(p.final_uah) for _, p in found if p.final_uah)
         lines = [f"🧾 <b>Итого по {len(found)} играм: {fmt_uzs(total)}</b>"]
@@ -190,33 +160,14 @@ async def answer_requests(message: Message, requests: list[Request], wait: Messa
         )
 
 
-# «подсчитай Tekken 8», «сколько стоит gta5» — ключевое слово перед названием убираем
-TRIGGER_RE = re.compile(
-    r"^\s*(под?считай(те)?|под?считать|сколько\s+(стоит|стоят|будет)|какая\s+цена|цена|прайс)\b[\s:,.—-]*",
-    re.I,
-)
-
-
-def strip_trigger(text: str) -> str:
-    m = TRIGGER_RE.match(text or "")
-    return text[m.end():] if m else text
-
-
-@dp.message(F.chat.type == ChatType.PRIVATE, F.text & ~F.text.startswith("/"))
+@dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message):
-    if PSPLUS_RE.match(message.text):
-        await message.answer(PS_PLUS_TEXT)
-        return
-    text = strip_trigger(message.text)
-    if not text.strip():
-        await message.answer("Напишите название игры, например: <i>Tekken 8 ultimate</i>")
-        return
     wait = await message.answer("🔎 Ищу...")
-    requests = await parse_message(text)
+    requests = await parse_message(message.text)
     await answer_requests(message, requests, wait)
 
 
-@dp.message(F.chat.type == ChatType.PRIVATE, F.photo)
+@dp.message(F.photo)
 async def on_photo(message: Message, bot: Bot):
     if not ai_enabled():
         await message.answer(
@@ -240,13 +191,7 @@ async def main():
     if not token:
         raise SystemExit("Укажите BOT_TOKEN в файле .env или в переменной окружения")
     log.info("Claude API: %s", "включён" if ai_enabled() else "выключен (разбор по правилам)")
-    try:
-        bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    except TokenValidationError:
-        raise SystemExit(
-            "Неправильный BOT_TOKEN в файле .env. Возьмите токен в @BotFather (/mybots → бот → API Token)\n"
-            "и запишите его так: BOT_TOKEN=1234567890:AAE...  (без пробелов и кавычек)"
-        )
+    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await dp.start_polling(bot)
 
 
