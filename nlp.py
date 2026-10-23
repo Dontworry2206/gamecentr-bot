@@ -5,6 +5,8 @@
 он понимает любые формулировки и исправляет опечатки.
 """
 
+from __future__ import annotations
+
 import difflib
 import json
 import logging

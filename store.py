@@ -5,6 +5,8 @@
 цену (обычную и со скидкой), классификацию и обложку.
 """
 
+from __future__ import annotations
+
 import difflib
 import json
 import re

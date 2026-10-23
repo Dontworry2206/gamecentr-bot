@@ -1,5 +1,7 @@
 """Telegram-бот GameCentr: присылаете название игры (или список, или фото) — получаете цену в UZS и обложку."""
 
+from __future__ import annotations
+
 import asyncio
 import html
 import io
