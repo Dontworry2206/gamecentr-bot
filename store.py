@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from urllib.parse import quote
 
 import aiohttp
+
+log = logging.getLogger("gamecentr.store")
 
 REGION = "ru-ua"
 BASE_URL = f"https://store.playstation.com/{REGION}"
@@ -223,8 +226,12 @@ def _base_title(name: str) -> str:
 
 async def _get(session: aiohttp.ClientSession, url: str) -> str:
     async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as r:
+        text = await r.text()
+        log.info("GET %s -> HTTP %s, %d байт, JSON-блоков: %d", url, r.status, len(text), len(SCRIPT_RE.findall(text)))
+        if r.status >= 400:
+            log.warning("PS Store ответил ошибкой %s на %s (финальный адрес: %s)", r.status, url, r.url)
         r.raise_for_status()
-        return await r.text()
+        return text
 
 
 # Издания: каноническое слово -> как оно встречается в названиях в магазине

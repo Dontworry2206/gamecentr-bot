@@ -12,7 +12,7 @@ import re
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatAction, ChatType, ParseMode
+from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from aiogram.utils.token import TokenValidationError
@@ -50,25 +50,45 @@ async def start(message: Message):
     )
 
 
+PSPLUS_RE = re.compile(
+    r"^\s*(/psplus\b|(сколько\s+сто\w+|прайс|цен\w*|какие)?\s*(на\s+)?"
+    r"(ps\s*plus|пс\s*плюс|подпис\w*|ea\s*play)\s*\??\s*$)",
+    re.I,
+)
+
+
 @dp.message(Command("psplus"))
 async def psplus(message: Message):
     await message.answer(PS_PLUS_TEXT)
 
 
+class StoreUnavailable(Exception):
+    """PS Store не ответил ни на один вариант запроса."""
+
+
 async def lookup(req: Request) -> list[Product]:
     """Пробуем варианты запроса: исходный, русский алиас, транслит."""
-    for query in search_variants(req.query):
-        if req.mode == CHEAPEST:
-            products = await find_cheapest(query, req.count, req.exclude_plus)
-        else:
-            product, _ = await find_game(query, req.edition or None)
-            products = [product] if product else []
+    variants = search_variants(req.query)
+    errors = 0
+    for query in variants:
+        try:
+            if req.mode == CHEAPEST:
+                products = await find_cheapest(query, req.count, req.exclude_plus)
+            else:
+                product, _ = await find_game(query, req.edition or None)
+                products = [product] if product else []
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("Ошибка запроса к PS Store (%r): %r", query, e)
+            errors += 1
+            continue
         if products:
             for p in products:
                 log.info("%r [%s %s] -> %r: %s, %s грн (база %s)", req.original or req.query, req.mode,
                          req.edition, query, p.name, p.final_uah, p.base_uah)
             return products
-    log.info("%r [%s] -> не найдено", req.original or req.query, req.mode)
+    log.info("%r [%s] -> не найдено (варианты: %s)", req.original or req.query, req.mode, variants)
+    if errors == len(variants):
+        raise StoreUnavailable
     return []
 
 
@@ -115,32 +135,23 @@ async def send_product(message: Message, product: Product, req: Request, caption
     await message.answer(caption)
 
 
-async def progress(message: Message, wait: Message | None, text: str):
-    """В личке с ботом — правим сообщение «Ищу...», в чатах с клиентами — статус «печатает»."""
-    if wait is not None:
-        await wait.edit_text(text)
-    else:
-        await message.bot.send_chat_action(
-            message.chat.id, ChatAction.TYPING, business_connection_id=message.business_connection_id
-        )
-
-
-async def answer_requests(message: Message, requests: list[Request], wait: Message | None):
+async def answer_requests(message: Message, requests: list[Request], wait: Message):
     if not requests:
-        text = "🤔 Не нашёл в сообщении названия игры. Напишите, например: <i>God of War</i>"
-        await (wait.edit_text(text) if wait else message.answer(text))
+        await wait.edit_text("🤔 Не нашёл в сообщении названия игры. Напишите, например: <i>God of War</i>")
         return
 
     found: list[tuple[Request, Product]] = []
     missing: list[Request] = []
     collections: list[Request] = []
+    unavailable: list[Request] = []
     for i, req in enumerate(requests, 1):
-        await progress(message, wait, f"🔎 Ищу {i} из {len(requests)}: «{html.escape(req.query)}»...")
+        if len(requests) > 1:
+            await wait.edit_text(f"🔎 Ищу {i} из {len(requests)}: «{html.escape(req.query)}»...")
         try:
             products = await lookup(req)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log.warning("Ошибка запроса к PS Store: %r", e)
+        except StoreUnavailable:
             products = []
+            unavailable.append(req)
         if not products:
             missing.append(req)
         elif req.count > 1:
@@ -151,8 +162,12 @@ async def answer_requests(message: Message, requests: list[Request], wait: Messa
             found.append((req, products[0]))
             await send_product(message, products[0], req)
 
-    if wait is not None:
-        await wait.delete()
+    await wait.delete()
+    if unavailable:
+        await message.answer("⚠️ PS Store сейчас не отвечает, попробуйте через минуту.")
+        missing = [r for r in missing if r not in unavailable]
+        if not missing and not found and not collections:
+            return
     if len(requests) > 1 and found:
         total = sum(uah_to_uzs(p.final_uah) for _, p in found if p.final_uah)
         lines = [f"🧾 <b>Итого по {len(found)} играм: {fmt_uzs(total)}</b>"]
@@ -175,74 +190,48 @@ async def answer_requests(message: Message, requests: list[Request], wait: Messa
         )
 
 
-# Слова, на которые бот отвечает в чатах с клиентами и в группах
+# «подсчитай Tekken 8», «сколько стоит gta5» — ключевое слово перед названием убираем
 TRIGGER_RE = re.compile(
     r"^\s*(под?считай(те)?|под?считать|сколько\s+(стоит|стоят|будет)|какая\s+цена|цена|прайс)\b[\s:,.—-]*",
     re.I,
 )
 
 
-def strip_trigger(text: str) -> str | None:
-    """'подсчитай Tekken 8' -> 'Tekken 8'. Нет ключевого слова в начале — None."""
+def strip_trigger(text: str) -> str:
     m = TRIGGER_RE.match(text or "")
-    return text[m.end():] if m else None
+    return text[m.end():] if m else text
 
 
-def needs_trigger(message: Message) -> bool:
-    """В личке с ботом отвечаем на всё, в бизнес-чатах с клиентами и группах — только по ключевым словам."""
-    return bool(message.business_connection_id) or message.chat.type != ChatType.PRIVATE
-
-
-async def handle_text(message: Message):
-    if message.sender_business_bot:  # наше же сообщение, отправленное от имени владельца
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text & ~F.text.startswith("/"))
+async def on_text(message: Message):
+    if PSPLUS_RE.match(message.text):
+        await message.answer(PS_PLUS_TEXT)
         return
-    rest = strip_trigger(message.text)
-    if rest is None:
-        if needs_trigger(message):
-            return
-        rest = message.text
-    if not rest.strip():
-        await message.answer("Напишите название игры, например: <i>подсчитай Tekken 8 ultimate</i>")
+    text = strip_trigger(message.text)
+    if not text.strip():
+        await message.answer("Напишите название игры, например: <i>Tekken 8 ultimate</i>")
         return
-    wait = None if needs_trigger(message) else await message.answer("🔎 Ищу...")
-    if wait is None:
-        await progress(message, None, "")
-    requests = await parse_message(rest)
+    wait = await message.answer("🔎 Ищу...")
+    requests = await parse_message(text)
     await answer_requests(message, requests, wait)
 
 
-async def handle_photo(message: Message, bot: Bot):
-    if message.sender_business_bot:
-        return
-    caption = message.caption
-    if needs_trigger(message):
-        caption = strip_trigger(caption)
-        if caption is None:  # клиент прислал фото без «сколько стоит» — не вмешиваемся
-            return
+@dp.message(F.chat.type == ChatType.PRIVATE, F.photo)
+async def on_photo(message: Message, bot: Bot):
     if not ai_enabled():
         await message.answer(
             "📷 Распознавание фото включается ключом Claude API (ANTHROPIC_API_KEY в .env). "
             "Пока напишите название игры текстом."
         )
         return
-    wait = None if needs_trigger(message) else await message.answer("📷 Смотрю фото...")
-    await progress(message, wait, "📷 Смотрю фото...")
+    wait = await message.answer("📷 Смотрю фото...")
     buf = io.BytesIO()
     await bot.download(message.photo[-1], destination=buf)
-    requests = await parse_photo(buf.getvalue(), caption or None)
+    requests = await parse_photo(buf.getvalue(), message.caption)
     if requests is None:
-        text = "⚠️ Не получилось распознать фото, напишите название игры текстом."
-        await (wait.edit_text(text) if wait else message.answer(text))
+        await wait.edit_text("⚠️ Не получилось распознать фото, напишите название игры текстом.")
         return
     await answer_requests(message, requests, wait)
-
-
-# Личка с ботом и группы
-dp.message.register(handle_text, F.text & ~F.text.startswith("/"))
-dp.message.register(handle_photo, F.photo)
-# Ваши чаты с клиентами через «Telegram для бизнеса → Автоматизация чатов»
-dp.business_message.register(handle_text, F.text)
-dp.business_message.register(handle_photo, F.photo)
 
 
 async def main():

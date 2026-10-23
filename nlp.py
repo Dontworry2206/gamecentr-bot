@@ -37,6 +37,22 @@ ALIASES = {
     "гта": "Grand Theft Auto V",
     "гта 5": "Grand Theft Auto V",
     "гта 6": "Grand Theft Auto VI",
+    "gta": "Grand Theft Auto V",
+    "gta 5": "Grand Theft Auto V",
+    "gta v": "Grand Theft Auto V",
+    "gta 6": "Grand Theft Auto VI",
+    "rdr 2": "Red Dead Redemption 2",
+    "gow": "God of War",
+    "tlou": "The Last of Us",
+    "mk 1": "Mortal Kombat 1",
+    "mk 11": "Mortal Kombat 11",
+    "fc 25": "EA SPORTS FC 25",
+    "fc 26": "EA SPORTS FC 26",
+    "fifa 25": "EA SPORTS FC 25",
+    "fifa 26": "EA SPORTS FC 26",
+    "ufc 5": "EA SPORTS UFC 5",
+    "rdr": "Red Dead Redemption 2",
+    "cod": "Call of Duty",
     "рдр": "Red Dead Redemption 2",
     "рдр 2": "Red Dead Redemption 2",
     "ред дед": "Red Dead Redemption 2",
@@ -232,8 +248,13 @@ def _clean(text: str) -> Request:
     return req
 
 
+def split_digits(text: str) -> str:
+    """'гта5' -> 'гта 5', 'fc26' -> 'fc 26'."""
+    return re.sub(r"(?<=[^\W\d_])(?=\d)|(?<=\d)(?=[^\W\d_])", " ", text)
+
+
 def alias(query: str) -> str | None:
-    key = re.sub(r"[-–—:]", " ", query.lower().replace("ё", "е"))
+    key = re.sub(r"[-–—:]", " ", split_digits(query).lower().replace("ё", "е"))
     key = re.sub(r"\s+", " ", key).strip()
     if key in ALIASES:
         return ALIASES[key]
@@ -257,6 +278,8 @@ def search_variants(query: str) -> list[str]:
     if a:
         variants.append(a)
     variants.append(query)
+    if split_digits(query) != query:
+        variants.append(split_digits(query))
     if has_cyrillic(query):
         variants.append(transliterate(query))
     seen, out = set(), []
