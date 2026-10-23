@@ -5,6 +5,7 @@
 цену (обычную и со скидкой), классификацию и обложку.
 """
 
+import difflib
 import json
 import re
 from dataclasses import dataclass
@@ -173,9 +174,27 @@ def _games(products: list[Product]) -> list[Product]:
     return [p for p in products if p.classification in GAME_CLASSES or p.classification is None]
 
 
+ROMAN = {"1": "i", "2": "ii", "3": "iii", "4": "iv", "5": "v", "6": "vi", "7": "vii", "8": "viii", "9": "ix", "10": "x"}
+
+
+def _token_matches(token: str, name: str, words: list[str]) -> bool:
+    if token in name or ROMAN.get(token) in words:
+        return True
+    # Опечатки: «eldn» ~ «elden», «spiderman» ~ «spider»
+    if len(token) >= 3 and not token.isdigit():
+        return any(difflib.SequenceMatcher(None, token, w).ratio() >= 0.75 for w in words)
+    return False
+
+
 def _relevant(products: list[Product], query: str) -> list[Product]:
     tokens = _norm(query).split()
-    return [p for p in _games(products) if all(t in _norm(p.name) for t in tokens)]
+    out = []
+    for p in _games(products):
+        name = _norm(p.name)
+        words = name.split()
+        if all(_token_matches(t, name, words) for t in tokens):
+            out.append(p)
+    return out
 
 
 def _base_title(name: str) -> str:
@@ -187,6 +206,15 @@ async def _get(session: aiohttp.ClientSession, url: str) -> str:
     async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as r:
         r.raise_for_status()
         return await r.text()
+
+
+async def find_cheapest(query: str) -> Product | None:
+    """Самая дешёвая платная игра среди результатов поиска (например, «LEGO»)."""
+    async with aiohttp.ClientSession() as session:
+        html = await _get(session, f"{BASE_URL}/search/{quote(query)}")
+    games = _relevant(extract_products(html), query)
+    paid = [p for p in games if p.final_uah]
+    return min(paid, key=lambda p: p.final_uah) if paid else None
 
 
 async def find_game(query: str) -> tuple[Product | None, list[Product]]:

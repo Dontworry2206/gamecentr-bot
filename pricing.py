@@ -21,8 +21,35 @@ def uah_rate(uah: float) -> int:
     return rate
 
 
+# Та же таблица в виде диапазонов «от — до», как в прайсе. Нужна для самопроверки.
+UAH_RANGES = [
+    (249, 299, 430),
+    (300, 699, 390),
+    (700, 1099, 370),
+    (1100, 1499, 360),
+    (1500, 1999, 350),
+    (2000, 2899, 340),
+    (2900, 5000, 330),
+]
+
+
+def _rate_by_ranges(uah: float) -> int:
+    if uah < UAH_RANGES[0][0]:
+        return UAH_RANGES[0][2]
+    if uah > UAH_RANGES[-1][1]:
+        return UAH_RANGES[-1][2]
+    for lo, hi, rate in UAH_RANGES:
+        if lo <= uah < hi + 1:  # +1: дробные цены вроде 299,50 остаются в своём диапазоне
+            return rate
+    raise ValueError(f"Цена {uah} грн не попала ни в один диапазон")
+
+
 def uah_to_uzs(uah: float) -> int:
-    return round(uah * uah_rate(uah))
+    rate = uah_rate(uah)
+    check = _rate_by_ranges(uah)
+    if rate != check:
+        raise ValueError(f"Расхождение курса для {uah} грн: {rate} != {check}")
+    return round(uah * rate)
 
 
 def fmt_uzs(amount: int) -> str:
