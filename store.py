@@ -43,6 +43,7 @@ class Product:
     discount_text: str | None
     image: str | None
     classification: str | None
+    in_plus: bool = False  # входит в каталог подписки PS Plus
 
     @property
     def on_sale(self) -> bool:
@@ -122,6 +123,20 @@ def _pick_image(media, refs) -> str | None:
     return images[0]["url"] if images else None
 
 
+# Пометки «Входит в Extra», «Включено в подписку». Не «скидка с PS Plus» — это не каталог
+PLUS_TEXT_RE = re.compile(r"входит|включ|included|extra|premium|каталог", re.I)
+
+
+def _in_subscription(price: dict, plus_branded: bool) -> bool:
+    """Игра доступна в каталоге PS Plus (а не просто скидка для подписчиков)."""
+    if price.get("isTiedToSubscription"):
+        return True
+    texts = [price.get("upsellText"), price.get("discountText"), price.get("discountedPrice")]
+    has_text = any(t and PLUS_TEXT_RE.search(str(t)) for t in texts)
+    # «Входит в Extra» — цена для подписчика 0 или пометка в тексте
+    return has_text or (plus_branded and parse_price(price.get("discountedPrice")) == 0)
+
+
 def extract_products(html: str) -> list[Product]:
     blobs = list(_json_blobs(html))
     refs = _collect_refs(blobs)
@@ -140,8 +155,9 @@ def extract_products(html: str) -> list[Product]:
             final = parse_price(price.get("discountedPrice")) if price.get("discountedPrice") else base
             if price.get("isFree"):
                 base = final = 0.0
+            plus_branded = "PS_PLUS" in (price.get("serviceBranding") or [])
             # Скидка только для подписчиков PS Plus — нам не подходит
-            if "PS_PLUS" in (price.get("serviceBranding") or []) and final != base:
+            if plus_branded and final != base:
                 final = base
             prod = Product(
                 id=pid,
@@ -151,6 +167,7 @@ def extract_products(html: str) -> list[Product]:
                 discount_text=price.get("discountText") if final != base else None,
                 image=_pick_image(d.get("media"), refs),
                 classification=d.get("storeDisplayClassification"),
+                in_plus=_in_subscription(price, plus_branded),
             )
             old = found.get(pid)
             if old is None or (old.image is None and prod.image):
@@ -208,17 +225,43 @@ async def _get(session: aiohttp.ClientSession, url: str) -> str:
         return await r.text()
 
 
-async def find_cheapest(query: str) -> Product | None:
-    """Самая дешёвая платная игра среди результатов поиска (например, «LEGO»)."""
+# Издания: каноническое слово -> как оно встречается в названиях в магазине
+EDITION_NAME_RE = {
+    "ultimate": r"ultimate",
+    "deluxe": r"deluxe",
+    "gold": r"gold",
+    "premium": r"premium",
+    "complete": r"complete|definitive",
+    "goty": r"goty|game of the year",
+    "cross-gen": r"cross.gen",
+    "standard": r"standard",
+}
+_ANY_EDITION = re.compile(r"ultimate|deluxe|gold|premium|complete|definitive|goty|game of the year", re.I)
+
+
+def edition_matches(name: str, edition: str) -> bool:
+    if edition == "standard":
+        return bool(re.search("standard", name, re.I)) or not _ANY_EDITION.search(name)
+    return bool(re.search(EDITION_NAME_RE.get(edition, re.escape(edition)), name, re.I))
+
+
+async def find_cheapest(query: str, count: int = 1, exclude_plus: bool = False) -> list[Product]:
+    """Самые дешёвые платные игры среди результатов поиска (например, «LEGO»), по возрастанию цены."""
     async with aiohttp.ClientSession() as session:
         html = await _get(session, f"{BASE_URL}/search/{quote(query)}")
     games = _relevant(extract_products(html), query)
-    paid = [p for p in games if p.final_uah]
-    return min(paid, key=lambda p: p.final_uah) if paid else None
+    paid = [p for p in games if p.final_uah and not (exclude_plus and p.in_plus)]
+    paid.sort(key=lambda p: p.final_uah)
+    return paid[:count]
 
 
-async def find_game(query: str) -> tuple[Product | None, list[Product]]:
-    """Возвращает (выбранное издание, все найденные издания этой игры)."""
+async def find_game(query: str, edition: str | None = None) -> tuple[Product | None, list[Product]]:
+    """Возвращает (выбранное издание, все найденные издания этой игры).
+
+    edition — издание, которое просили явно («ultimate», «deluxe»...). Если его нет
+    в магазине, выбирается издание по обычному правилу, а вызывающий код может это
+    проверить через edition_matches.
+    """
     async with aiohttp.ClientSession() as session:
         html = await _get(session, f"{BASE_URL}/search/{quote(query)}")
         search_results = extract_products(html)
@@ -247,7 +290,8 @@ async def find_game(query: str) -> tuple[Product | None, list[Product]]:
     priced = [p for p in candidates if p.final_uah is not None]
     if not priced:
         return None, candidates
-    chosen = choose_edition(priced)
+    wanted = [p for p in priced if edition and edition_matches(p.name, edition)]
+    chosen = min(wanted, key=lambda p: p.final_uah) if wanted else choose_edition(priced)
     if not chosen.image:
         chosen.image = next((p.image for p in candidates if p.image), None)
     return chosen, priced

@@ -25,6 +25,9 @@ class Request:
     query: str
     mode: str = BEST
     original: str = ""
+    edition: str = ""  # издание, которое просили явно: ultimate, deluxe, gold...
+    count: int = 1  # сколько игр вернуть в режиме cheapest («подборка» — несколько)
+    exclude_plus: bool = False  # не предлагать игры из каталога PS Plus
 
 
 # Народные и русские названия -> название в PS Store
@@ -158,6 +161,31 @@ FILLER_RE = re.compile(
 
 LIST_MARK_RE = re.compile(r"^\s*(\d+[.)]|[-•*–—])\s*")
 
+# Сокращения и русские названия изданий -> каноническое слово (см. store.EDITION_NAME_RE)
+EDITIONS = {
+    "ult": "ultimate", "ulti": "ultimate", "ultimate": "ultimate", "ультимейт": "ultimate",
+    "ультимат": "ultimate", "ульта": "ultimate", "ульт": "ultimate",
+    "deluxe": "deluxe", "dlx": "deluxe", "delux": "deluxe", "делюкс": "deluxe", "делакс": "deluxe",
+    "gold": "gold", "голд": "gold", "золотое": "gold", "золотая": "gold",
+    "premium": "premium", "премиум": "premium",
+    "complete": "complete", "definitive": "complete", "полное": "complete", "комплит": "complete",
+    "goty": "goty",
+    "cross-gen": "cross-gen",
+    "standard": "standard", "standart": "standard", "стандарт": "standard", "стандартное": "standard",
+}
+EDITION_FILLER = {"edition", "ed", "издание", "версия", "version", "издания"}
+
+COLLECTION_RE = re.compile(r"подборк\w*|\bтоп\s*(\d+)?|\bсписок\b|несколько|(деш|диш)[ёеоo]в(ые|ых)\b", re.I)
+COLLECTION_SIZE = 5
+
+_PLUS_WORD = r"(подписк\w*|ps\s*plus|пс\s*плюс|плюс\w*|plus|extra|экстра)"
+NO_PLUS_RE = re.compile(
+    # «(каких нет в подписке)» целиком или «без ps plus», «не в подписке» в тексте
+    r"\([^()]*\b(нет|не|без|кроме)\b[^()]*" + _PLUS_WORD + r"[^()]*\)"
+    r"|\b(нет|не|без|кроме)\b(\s+[\w-]+){0,3}?\s+" + _PLUS_WORD,
+    re.I,
+)
+
 
 def transliterate(text: str) -> str:
     return "".join(_TRANSLIT.get(ch, _TRANSLIT.get(ch.lower(), ch)) for ch in text)
@@ -167,12 +195,39 @@ def has_cyrillic(text: str) -> bool:
     return bool(re.search(r"[а-яё]", text, re.I))
 
 
-def _clean(text: str) -> tuple[str, str]:
-    mode = CHEAPEST if CHEAP_RE.search(text) else BEST
-    text = CHEAP_RE.sub(" ", text)
+def split_edition(query: str) -> tuple[str, str]:
+    """'Tekken 8 ultimate' -> ('Tekken 8', 'ultimate'). 'Astro bot' -> ('Astro bot', '')."""
+    words, edition = [], ""
+    for w in query.split():
+        key = w.lower().strip(".,")
+        if key in EDITIONS and not edition:
+            edition = EDITIONS[key]
+        elif not (edition and key in EDITION_FILLER):
+            words.append(w)
+    if not words:  # запрос из одного слова-издания — не трогаем
+        return query, ""
+    return " ".join(words), edition
+
+
+def _clean(text: str) -> Request:
+    req = Request(query="", original=text)
+    if NO_PLUS_RE.search(text):
+        req.exclude_plus = True
+        text = NO_PLUS_RE.sub(" ", text)
+    collection = COLLECTION_RE.search(text)
+    if collection:
+        req.mode = CHEAPEST
+        req.count = min(int(collection.group(1)), 10) if collection.group(1) else COLLECTION_SIZE
+        text = COLLECTION_RE.sub(" ", text)
+    if CHEAP_RE.search(text):
+        req.mode = CHEAPEST
+        text = CHEAP_RE.sub(" ", text)
     text = FILLER_RE.sub(" ", text)
-    text = re.sub(r"[?!.,]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip(), mode
+    text = re.sub(r"\b(каких|которых|которые|что)\b", " ", text, flags=re.I)
+    text = re.sub(r"[?!.,()]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    req.query, req.edition = split_edition(text)
+    return req
 
 
 def alias(query: str) -> str | None:
@@ -219,9 +274,9 @@ def split_lines(text: str) -> list[str]:
 def parse_rules(text: str) -> list[Request]:
     requests = []
     for line in split_lines(text):
-        query, mode = _clean(line)
-        if query:
-            requests.append(Request(query=query, mode=mode, original=line))
+        req = _clean(line)
+        if req.query:
+            requests.append(req)
     return requests
 
 
@@ -237,9 +292,18 @@ SYSTEM_PROMPT = """Ты помогаешь продавцу игр для PlaySt
 «элден ринг» → «ELDEN RING»). Исправляй опечатки. Не добавляй издание (Deluxe и т.п.), \
 если пользователь сам его не назвал. Для запросов про серию или бренд («игры lego», «колда») \
 верни название серии: «LEGO», «Call of Duty».
+- edition — издание, если пользователь его назвал, одним словом: ultimate («ult», «ульта»), deluxe, \
+gold, premium, complete, goty, standard. Иначе пустая строка. В query издание не пиши.
 - mode — "cheapest", если просят самую дешёвую игру/вариант (дешёвая, подешевле, минимальная цена); \
 иначе "best".
+- count — сколько игр вернуть: 1, а если просят подборку, список, топ или «самые дешёвые» во \
+множественном числе — 5 (или названное число, максимум 10).
+- exclude_plus — true, если просят игры, которых нет в подписке PS Plus («каких нет в подписке»).
 - original — исходный фрагмент сообщения.
+
+Пример: «Street fighter 6 ult» → query «Street Fighter 6», edition «ultimate». \
+«Lego самые дешевые подборка(каких нет в подписке)» → query «LEGO», mode «cheapest», count 5, \
+exclude_plus true.
 
 Если в сообщении нет ни одной игры (приветствие, вопрос не про игры), верни пустой список."""
 
@@ -254,8 +318,11 @@ SCHEMA = {
                     "query": {"type": "string"},
                     "mode": {"type": "string", "enum": [BEST, CHEAPEST]},
                     "original": {"type": "string"},
+                    "edition": {"type": "string"},
+                    "count": {"type": "integer"},
+                    "exclude_plus": {"type": "boolean"},
                 },
-                "required": ["query", "mode", "original"],
+                "required": ["query", "mode", "original", "edition", "count", "exclude_plus"],
                 "additionalProperties": False,
             },
         }
@@ -319,7 +386,15 @@ async def parse_claude(text: str, image: bytes | None = None, media_type: str = 
         items = json.loads(raw)["requests"]
     except (ValueError, KeyError):
         return None
-    return [Request(**i) for i in items[:MAX_ITEMS] if i.get("query")]
+    requests = []
+    for i in items[:MAX_ITEMS]:
+        if not i.get("query"):
+            continue
+        req = Request(**i)
+        req.edition = EDITIONS.get(req.edition.lower().strip(), req.edition.lower().strip())
+        req.count = max(1, min(req.count, 10))
+        requests.append(req)
+    return requests
 
 
 async def parse_photo(image: bytes, caption: str | None) -> list[Request] | None:

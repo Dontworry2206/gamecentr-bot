@@ -15,7 +15,7 @@ from aiogram.types import Message
 
 from nlp import CHEAPEST, Request, ai_enabled, parse_message, parse_photo, search_variants
 from pricing import PS_PLUS_TEXT, fmt_uzs, uah_to_uzs
-from store import Product, find_cheapest, find_game
+from store import Product, edition_matches, find_cheapest, find_game
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gamecentr")
@@ -51,19 +51,27 @@ async def psplus(message: Message):
     await message.answer(PS_PLUS_TEXT)
 
 
-async def lookup(req: Request) -> Product | None:
+async def lookup(req: Request) -> list[Product]:
     """Пробуем варианты запроса: исходный, русский алиас, транслит."""
     for query in search_variants(req.query):
         if req.mode == CHEAPEST:
-            product = await find_cheapest(query)
+            products = await find_cheapest(query, req.count, req.exclude_plus)
         else:
-            product, _ = await find_game(query)
-        if product:
-            log.info("%r [%s] -> %r: %s, %s грн (база %s)",
-                     req.original or req.query, req.mode, query, product.name, product.final_uah, product.base_uah)
-            return product
+            product, _ = await find_game(query, req.edition or None)
+            products = [product] if product else []
+        if products:
+            for p in products:
+                log.info("%r [%s %s] -> %r: %s, %s грн (база %s)", req.original or req.query, req.mode,
+                         req.edition, query, p.name, p.final_uah, p.base_uah)
+            return products
     log.info("%r [%s] -> не найдено", req.original or req.query, req.mode)
-    return None
+    return []
+
+
+def price_line(product: Product) -> str:
+    if product.final_uah == 0:
+        return "Бесплатно"
+    return fmt_uzs(uah_to_uzs(product.final_uah))
 
 
 def caption_for(product: Product, req: Request) -> str:
@@ -72,18 +80,28 @@ def caption_for(product: Product, req: Request) -> str:
         lines.append(f"🏷 Самая дешёвая по запросу «{html.escape(req.query)}»:")
     lines.append(f"🎮 <b>{html.escape(product.name)}</b>")
     lines.append("")
-    if product.final_uah == 0:
-        lines.append("💰 Цена: <b>Бесплатно</b>")
-    else:
-        lines.append(f"💰 Цена: <b>{fmt_uzs(uah_to_uzs(product.final_uah))}</b>")
-        if product.on_sale:
-            sale = f"🔥 Скидка {product.discount_text}" if product.discount_text else "🔥 Скидка"
-            lines.append(f"{sale} (без скидки {fmt_uzs(uah_to_uzs(product.base_uah))})")
+    lines.append(f"💰 Цена: <b>{price_line(product)}</b>")
+    if product.final_uah and product.on_sale:
+        sale = f"🔥 Скидка {product.discount_text}" if product.discount_text else "🔥 Скидка"
+        lines.append(f"{sale} (без скидки {fmt_uzs(uah_to_uzs(product.base_uah))})")
+    if req.edition and not edition_matches(product.name, req.edition):
+        lines.append(f"\n⚠️ Издания {req.edition.title()} в магазине нет — показал доступное.")
     return "\n".join(lines)
 
 
-async def send_product(message: Message, product: Product, req: Request):
-    caption = caption_for(product, req)
+def collection_caption(products: list[Product], req: Request) -> str:
+    title = f"🏷 Самые дешёвые по запросу «{html.escape(req.query)}»"
+    if req.exclude_plus:
+        title += " (без игр из PS Plus)"
+    lines = [title + ":", ""]
+    for i, p in enumerate(products, 1):
+        sale = f" 🔥 {html.escape(p.discount_text)}" if p.on_sale and p.discount_text else ""
+        lines.append(f"{i}. <b>{html.escape(p.name)}</b> — {price_line(p)}{sale}")
+    return "\n".join(lines)
+
+
+async def send_product(message: Message, product: Product, req: Request, caption: str | None = None):
+    caption = caption or caption_for(product, req)
     if product.image:
         try:
             await message.answer_photo(product.image, caption=caption)
@@ -100,31 +118,41 @@ async def answer_requests(message: Message, requests: list[Request], wait: Messa
 
     found: list[tuple[Request, Product]] = []
     missing: list[Request] = []
+    collections: list[Request] = []
     for i, req in enumerate(requests, 1):
         if len(requests) > 1:
             await wait.edit_text(f"🔎 Ищу {i} из {len(requests)}: «{html.escape(req.query)}»...")
         try:
-            product = await lookup(req)
+            products = await lookup(req)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning("Ошибка запроса к PS Store: %r", e)
-            product = None
-        if product:
-            found.append((req, product))
-            await send_product(message, product, req)
-        else:
+            products = []
+        if not products:
             missing.append(req)
+        elif req.count > 1:
+            # Подборка — одно сообщение с обложкой самой дешёвой игры; в итог не входит
+            await send_product(message, products[0], req, collection_caption(products, req))
+            collections.append(req)
+        else:
+            found.append((req, products[0]))
+            await send_product(message, products[0], req)
 
     await wait.delete()
-    if len(requests) > 1:
+    if len(requests) > 1 and found:
         total = sum(uah_to_uzs(p.final_uah) for _, p in found if p.final_uah)
         lines = [f"🧾 <b>Итого по {len(found)} играм: {fmt_uzs(total)}</b>"]
         for _, p in found:
             price = "бесплатно" if p.final_uah == 0 else fmt_uzs(uah_to_uzs(p.final_uah))
             lines.append(f"• {html.escape(p.name)} — {price}")
+        if collections:
+            lines.append("")
+            lines.append("📋 Подборки (в итог не входят): " + ", ".join(f"«{html.escape(r.query)}»" for r in collections))
         if missing:
             lines.append("")
             lines.append("😔 Не нашёл: " + ", ".join(f"«{html.escape(r.original or r.query)}»" for r in missing))
         await message.answer("\n".join(lines))
+    elif missing and len(requests) > 1:
+        await message.answer("😔 Не нашёл: " + ", ".join(f"«{html.escape(r.original or r.query)}»" for r in missing))
     elif missing:
         await message.answer(
             f"😔 Игра «{html.escape(missing[0].original or missing[0].query)}» не найдена. "
