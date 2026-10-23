@@ -5,11 +5,12 @@ import html
 import io
 import logging
 import os
+import re
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatAction, ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
@@ -111,17 +112,27 @@ async def send_product(message: Message, product: Product, req: Request, caption
     await message.answer(caption)
 
 
-async def answer_requests(message: Message, requests: list[Request], wait: Message):
+async def progress(message: Message, wait: Message | None, text: str):
+    """В личке с ботом — правим сообщение «Ищу...», в чатах с клиентами — статус «печатает»."""
+    if wait is not None:
+        await wait.edit_text(text)
+    else:
+        await message.bot.send_chat_action(
+            message.chat.id, ChatAction.TYPING, business_connection_id=message.business_connection_id
+        )
+
+
+async def answer_requests(message: Message, requests: list[Request], wait: Message | None):
     if not requests:
-        await wait.edit_text("🤔 Не нашёл в сообщении названия игры. Напишите, например: <i>God of War</i>")
+        text = "🤔 Не нашёл в сообщении названия игры. Напишите, например: <i>God of War</i>"
+        await (wait.edit_text(text) if wait else message.answer(text))
         return
 
     found: list[tuple[Request, Product]] = []
     missing: list[Request] = []
     collections: list[Request] = []
     for i, req in enumerate(requests, 1):
-        if len(requests) > 1:
-            await wait.edit_text(f"🔎 Ищу {i} из {len(requests)}: «{html.escape(req.query)}»...")
+        await progress(message, wait, f"🔎 Ищу {i} из {len(requests)}: «{html.escape(req.query)}»...")
         try:
             products = await lookup(req)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -137,7 +148,8 @@ async def answer_requests(message: Message, requests: list[Request], wait: Messa
             found.append((req, products[0]))
             await send_product(message, products[0], req)
 
-    await wait.delete()
+    if wait is not None:
+        await wait.delete()
     if len(requests) > 1 and found:
         total = sum(uah_to_uzs(p.final_uah) for _, p in found if p.final_uah)
         lines = [f"🧾 <b>Итого по {len(found)} играм: {fmt_uzs(total)}</b>"]
@@ -160,29 +172,74 @@ async def answer_requests(message: Message, requests: list[Request], wait: Messa
         )
 
 
-@dp.message(F.text & ~F.text.startswith("/"))
-async def on_text(message: Message):
-    wait = await message.answer("🔎 Ищу...")
-    requests = await parse_message(message.text)
+# Слова, на которые бот отвечает в чатах с клиентами и в группах
+TRIGGER_RE = re.compile(
+    r"^\s*(под?считай(те)?|под?считать|сколько\s+(стоит|стоят|будет)|какая\s+цена|цена|прайс)\b[\s:,.—-]*",
+    re.I,
+)
+
+
+def strip_trigger(text: str) -> str | None:
+    """'подсчитай Tekken 8' -> 'Tekken 8'. Нет ключевого слова в начале — None."""
+    m = TRIGGER_RE.match(text or "")
+    return text[m.end():] if m else None
+
+
+def needs_trigger(message: Message) -> bool:
+    """В личке с ботом отвечаем на всё, в бизнес-чатах с клиентами и группах — только по ключевым словам."""
+    return bool(message.business_connection_id) or message.chat.type != ChatType.PRIVATE
+
+
+async def handle_text(message: Message):
+    if message.sender_business_bot:  # наше же сообщение, отправленное от имени владельца
+        return
+    rest = strip_trigger(message.text)
+    if rest is None:
+        if needs_trigger(message):
+            return
+        rest = message.text
+    if not rest.strip():
+        await message.answer("Напишите название игры, например: <i>подсчитай Tekken 8 ultimate</i>")
+        return
+    wait = None if needs_trigger(message) else await message.answer("🔎 Ищу...")
+    if wait is None:
+        await progress(message, None, "")
+    requests = await parse_message(rest)
     await answer_requests(message, requests, wait)
 
 
-@dp.message(F.photo)
-async def on_photo(message: Message, bot: Bot):
+async def handle_photo(message: Message, bot: Bot):
+    if message.sender_business_bot:
+        return
+    caption = message.caption
+    if needs_trigger(message):
+        caption = strip_trigger(caption)
+        if caption is None:  # клиент прислал фото без «сколько стоит» — не вмешиваемся
+            return
     if not ai_enabled():
         await message.answer(
             "📷 Распознавание фото включается ключом Claude API (ANTHROPIC_API_KEY в .env). "
             "Пока напишите название игры текстом."
         )
         return
-    wait = await message.answer("📷 Смотрю фото...")
+    wait = None if needs_trigger(message) else await message.answer("📷 Смотрю фото...")
+    await progress(message, wait, "📷 Смотрю фото...")
     buf = io.BytesIO()
     await bot.download(message.photo[-1], destination=buf)
-    requests = await parse_photo(buf.getvalue(), message.caption)
+    requests = await parse_photo(buf.getvalue(), caption or None)
     if requests is None:
-        await wait.edit_text("⚠️ Не получилось распознать фото, напишите название игры текстом.")
+        text = "⚠️ Не получилось распознать фото, напишите название игры текстом."
+        await (wait.edit_text(text) if wait else message.answer(text))
         return
     await answer_requests(message, requests, wait)
+
+
+# Личка с ботом и группы
+dp.message.register(handle_text, F.text & ~F.text.startswith("/"))
+dp.message.register(handle_photo, F.photo)
+# Ваши чаты с клиентами через «Telegram для бизнеса → Автоматизация чатов»
+dp.business_message.register(handle_text, F.text)
+dp.business_message.register(handle_photo, F.photo)
 
 
 async def main():
