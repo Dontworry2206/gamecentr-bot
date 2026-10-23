@@ -300,7 +300,7 @@ async def parse_claude(text: str, image: bytes | None = None, media_type: str = 
         })
     try:
         response = await client.beta.messages.create(
-            model=os.environ.get("CLAUDE_MODEL", "claude-opus-5-5"),
+            model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5"),
             max_tokens=4000,
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
