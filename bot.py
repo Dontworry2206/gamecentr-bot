@@ -15,6 +15,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
+from aiogram.utils.token import TokenValidationError
 
 from nlp import CHEAPEST, Request, ai_enabled, parse_message, parse_photo, search_variants
 from pricing import PS_PLUS_TEXT, fmt_uzs, uah_to_uzs
@@ -250,7 +251,13 @@ async def main():
     if not token:
         raise SystemExit("Укажите BOT_TOKEN в файле .env или в переменной окружения")
     log.info("Claude API: %s", "включён" if ai_enabled() else "выключен (разбор по правилам)")
-    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    try:
+        bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    except TokenValidationError:
+        raise SystemExit(
+            "Неправильный BOT_TOKEN в файле .env. Возьмите токен в @BotFather (/mybots → бот → API Token)\n"
+            "и запишите его так: BOT_TOKEN=1234567890:AAE...  (без пробелов и кавычек)"
+        )
     await dp.start_polling(bot)
 
 
